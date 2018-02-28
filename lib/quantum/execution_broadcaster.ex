@@ -8,8 +8,11 @@ defmodule Quantum.ExecutionBroadcaster do
   require Logger
 
   alias Quantum.{Job, Util, DateLibrary}
-  alias Crontab.{Scheduler, CronExpression}
   alias Quantum.DateLibrary.{InvalidDateTimeForTimezoneError, InvalidTimezoneError}
+  alias Crontab.Scheduler, as: CrontabScheduler
+  alias Crontab.CronExpression
+  alias Quantum.Storage.Adapter
+  alias Quantum.Scheduler
 
   defmodule JobInPastError do
     defexception message:
@@ -25,22 +28,50 @@ defmodule Quantum.ExecutionBroadcaster do
     * `job_broadcaster` - The name of the stage to listen to
 
   """
-  @spec start_link(GenServer.server(), GenServer.server()) :: GenServer.on_start()
-  def start_link(name, job_broadcaster) do
+  @spec start_link(GenServer.server(), GenServer.server(), Adapter, Scheduler) ::
+          GenServer.on_start()
+  def start_link(name, job_broadcaster, storage, scheduler) do
     __MODULE__
-    |> GenStage.start_link(job_broadcaster, name: name)
+    |> GenStage.start_link({job_broadcaster, storage, scheduler}, name: name)
     |> Util.start_or_link()
   end
 
   @doc false
-  @spec child_spec({GenServer.server(), GenServer.server()}) :: Supervisor.child_spec()
-  def child_spec({name, job_broadcaster}) do
-    %{super([]) | start: {__MODULE__, :start_link, [name, job_broadcaster]}}
+  @spec child_spec({GenServer.server(), GenServer.server(), Adapter, Scheduler}) ::
+          Supervisor.child_spec()
+  def child_spec({name, job_broadcaster, storage, scheduler}) do
+    %{super([]) | start: {__MODULE__, :start_link, [name, job_broadcaster, storage, scheduler]}}
   end
 
   @doc false
-  def init(job_broadcaster) do
-    state = %{jobs: [], time: NaiveDateTime.utc_now(), timer: nil}
+  def init({job_broadcaster, storage, scheduler}) do
+    last_execution_date =
+      case storage.last_execution_date(scheduler) do
+        %NaiveDateTime{} = date ->
+          Logger.debug(fn ->
+            "[#{inspect(Node.self())}][#{__MODULE__}] Using last known execution time #{
+              NaiveDateTime.to_iso8601(date)
+            }"
+          end)
+
+          date
+
+        :unknown ->
+          Logger.debug(fn ->
+            "[#{inspect(Node.self())}][#{__MODULE__}] Unknown last execution time, using now"
+          end)
+
+          NaiveDateTime.utc_now()
+      end
+
+    state = %{
+      jobs: [],
+      time: last_execution_date,
+      timer: nil,
+      storage: storage,
+      scheduler: scheduler
+    }
+
     {:producer_consumer, state, subscribe_to: [job_broadcaster]}
   end
 
@@ -68,7 +99,16 @@ defmodule Quantum.ExecutionBroadcaster do
     {:noreply, reboot_add_events, state}
   end
 
-  def handle_info(:execute, %{jobs: [{time_to_execute, jobs_to_execute} | tail]} = state) do
+  def handle_info(
+        :execute,
+        %{
+          jobs: [{time_to_execute, jobs_to_execute} | tail],
+          storage: storage,
+          scheduler: scheduler
+        } = state
+      ) do
+    :ok = storage.update_last_execution_date(scheduler, time_to_execute)
+
     state =
       state
       |> Map.put(:timer, nil)
@@ -119,6 +159,8 @@ defmodule Quantum.ExecutionBroadcaster do
       end)
 
     %{state | jobs: jobs}
+    |> sort_state
+    |> reset_timer
   end
 
   defp add_job_to_state(
@@ -155,7 +197,7 @@ defmodule Quantum.ExecutionBroadcaster do
          time
        ) do
     schedule
-    |> Scheduler.get_next_run_date(DateLibrary.to_tz!(time, timezone))
+    |> CrontabScheduler.get_next_run_date(DateLibrary.to_tz!(time, timezone))
     |> case do
       {:ok, date} ->
         {:ok, DateLibrary.to_utc!(date, timezone)}
